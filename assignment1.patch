@@ -1,0 +1,129 @@
+diff --git a/nova/api/openstack/compute/schemas/server_external_events.py b/nova/api/openstack/compute/schemas/server_external_events.py
+index b8a89e047d..bc42d9343e 100644
+--- a/nova/api/openstack/compute/schemas/server_external_events.py
++++ b/nova/api/openstack/compute/schemas/server_external_events.py
+@@ -32,7 +32,8 @@ create = {
+                             'network-changed',
+                             'network-vif-plugged',
+                             'network-vif-unplugged',
+-                            'network-vif-deleted'
++                            'network-vif-deleted',
++                            'custom-event'
+                         ],
+                     },
+                     'status': {
+diff --git a/nova/compute/manager.py b/nova/compute/manager.py
+index 496815fad8..e101fdee78 100644
+--- a/nova/compute/manager.py
++++ b/nova/compute/manager.py
+@@ -477,7 +477,7 @@ class ComputeVirtAPI(virtapi.VirtAPI):
+                     continue
+                 else:
+                     actual_event = event.wait()
+-                    if actual_event.status == 'completed':
++                    if actual_event.status == 'completed' or actual_event.status == 'finished':
+                         continue
+                 # If we get here, we have an event that was not completed,
+                 # nor skipped via exit_wait_early(). Decide whether to
+@@ -2194,6 +2194,7 @@ class ComputeManager(manager.Manager):
+             raise exception.BuildAbortException(
+                 'Trusted image certificates provided on host that does not '
+                 'support certificate validation.')
++
+
+     @wrap_exception()
+     @reverts_task_state
+@@ -10416,6 +10417,17 @@ class ComputeManager(manager.Manager):
+                 return
+         do_power_update()
+
++    def handle_custom_event(self, instance, event):
++        _event = self.instance_events.pop_instance_event(instance, event)
++        if _event and event.status == "finished":
++            LOG.debug('Processing success event %(event)s',
++                      {'event': event.key}, instance=instance)
++            _event.send(event)
++        elif _event and event.status == "failed":
++            LOG.debug('Processing failed event %(event)s',
++                      {'event': event.key}, instance=instance)
++            _event.send_exception(exception.VirtualInterfaceCreateException())
++
+     @wrap_exception()
+     def external_instance_event(self, context, instances, events):
+         # NOTE(danms): Some event types are handled by the manager, such
+@@ -10453,6 +10465,8 @@ class ComputeManager(manager.Manager):
+                 self.extend_volume(context, instance, event.tag)
+             elif event.name == 'power-update':
+                 self.power_update(context, instance, event.tag)
++            elif event.name == 'custom-event':
++                self.handle_custom_event(instance,event)
+             else:
+                 self._process_instance_event(instance, event)
+
+diff --git a/nova/conf/compute.py b/nova/conf/compute.py
+index e787424977..41cfda3e66 100644
+--- a/nova/conf/compute.py
++++ b/nova/conf/compute.py
+@@ -176,6 +176,7 @@ Related options:
+   ``vif_plugging_is_fatal`` is False, events should not be expected to
+   arrive at all.
+ """),
++    cfg.IntOpt('third_party_timeout',default=15, min=0, help=""),
+     cfg.IntOpt('arq_binding_timeout',
+         default=300,
+         min=1,
+diff --git a/nova/objects/external_event.py b/nova/objects/external_event.py
+index b1acfc4aa0..318b1f25b0 100644
+--- a/nova/objects/external_event.py
++++ b/nova/objects/external_event.py
+@@ -23,6 +23,7 @@ EVENT_NAMES = [
+     'network-vif-plugged',
+     'network-vif-unplugged',
+     'network-vif-deleted',
++    'custom-event',
+
+     # Volume was extended for this instance, tag is volume_id
+     'volume-extended',
+@@ -35,7 +36,7 @@ EVENT_NAMES = [
+     'accelerator-request-bound',
+ ]
+
+-EVENT_STATUSES = ['failed', 'completed', 'in-progress']
++EVENT_STATUSES = ['failed', 'completed', 'in-progress', 'finished']
+
+ # Possible tag values for the power-update event.
+ POWER_ON = 'POWER_ON'
+diff --git a/nova/virt/libvirt/driver.py b/nova/virt/libvirt/driver.py
+index e7ff852350..a8d08df0ec 100644
+--- a/nova/virt/libvirt/driver.py
++++ b/nova/virt/libvirt/driver.py
+@@ -7134,6 +7134,13 @@ class LibvirtDriver(driver.ComputeDriver):
+             if libvirt_secret is not None:
+                 libvirt_secret.undefine()
+
++    def _custom_failed_callback(self, event_name, instance):
++        LOG.error('Third Party Reported failure on event '
++                  '%(event)s for instance %(uuid)s',
++                  {'event': event_name, 'uuid': instance.uuid},
++                  instance=instance)
++        raise exception.VirtualInterfaceCreateException()
++
+     def _neutron_failed_callback(self, event_name, instance):
+         LOG.error('Neutron Reported failure on event '
+                   '%(event)s for instance %(uuid)s',
+@@ -7177,8 +7184,15 @@ class LibvirtDriver(driver.ComputeDriver):
+         else:
+             events = []
+
++        event_custom=[('custom-event',events[-1][1])]
+         pause = bool(events)
+         try:
++            with self.virtapi.wait_for_instance_event(
++                instance, event_custom, deadline=CONF.third_party_timeout,
++                error_callback=self._custom_failed_callback,
++            ):
++                import requests
++                requests.get('http://localhost:8000/{0}/{1}'.format(instance.uuid,event_custom[-1][1]))
+             with self.virtapi.wait_for_instance_event(
+                 instance, events, deadline=timeout,
+                 error_callback=self._neutron_failed_callback,

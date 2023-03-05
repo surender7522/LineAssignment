@@ -1,0 +1,124 @@
+diff --git a/nova/compute/api.py b/nova/compute/api.py
+index e756cdd..3b06a81 100644
+--- a/nova/compute/api.py
++++ b/nova/compute/api.py
+@@ -24,7 +24,8 @@ import copy
+ import functools
+ import re
+ import string
+-
++import json
++import requests
+ from castellan import key_manager
+ from oslo_log import log as logging
+ from oslo_messaging import exceptions as oslo_exceptions
+@@ -84,7 +85,6 @@ from nova import servicegroup
+ from nova import utils
+ from nova.virt import hardware
+ from nova.volume import cinder
+-
+ LOG = logging.getLogger(__name__)
+ 
+ get_notifier = functools.partial(rpc.get_notifier, service='compute')
+@@ -515,11 +515,12 @@ class API(base.Base):
+             'auto_disk_config': auto_disk_config
+         }
+ 
+-    def _new_instance_name_from_template(self, uuid, display_name, index):
++    def _new_instance_name_from_template(self, uuid, display_name, index, project_name):
+         params = {
+             'uuid': uuid,
+             'name': display_name,
+             'count': index + 1,
++            'project-name': project_name
+         }
+         try:
+             new_name = (CONF.multi_instance_display_name_template %
+@@ -533,7 +534,7 @@ class API(base.Base):
+     def _apply_instance_name_template(self, context, instance, index):
+         original_name = instance.display_name
+         new_name = self._new_instance_name_from_template(instance.uuid,
+-                instance.display_name, index)
++                instance.display_name, index, context.project_name)
+         instance.display_name = new_name
+         if not instance.get('hostname', None):
+             if utils.sanitize_hostname(original_name) == "":
+@@ -1568,14 +1569,60 @@ class API(base.Base):
+             instance.security_groups = objects.SecurityGroupList()
+         else:
+             instance.security_groups = security_groups
+-
++        instance.metadata["vm_count_no"] = str( 1  + self.get_latest_vm_count(instance.display_name))
+         self._populate_instance_names(instance, num_instances)
+         instance.shutdown_terminate = shutdown_terminate
+-        if num_instances > 1 and self.cell_type != 'api':
++        if (num_instances > 1 or CONF.force_multi_instance_display_name) and self.cell_type != 'api':
+             instance = self._apply_instance_name_template(context, instance,
+-                                                          index)
++                                                          (int(instance.metadata["vm_count_no"])-1))
+ 
+         return instance
++    
++    def authorize(self, url, user, passw):
++        js = {
++            "auth": {
++                "identity": {
++                    "methods": ["password"],
++                    "password": {
++                        "user": {
++                            "name": user,
++                            "domain": { "id": "default" },
++                            "password": passw
++                        }
++                    },
++
++                },
++                "scope": {
++                    "project": {
++                        "name": "demo",
++                        "domain": { "id": "default" }
++                    }
++                }
++            }
++        }
++        r = requests.post(
++            "http://{0}/identity/v3/auth/tokens".format(url), data=json.dumps(js)
++        )
++        return r.headers.get("X-Subject-Token", "")
++
++
++    def get_latest_vm_count(self, name):
++        url = "localhost"
++        token = self.authorize(url, "admin", "secret")
++        headers = {"X-Auth-Token": token}
++        r = requests.get("http://{0}/compute/v2.1/servers?sort_key=hostname&name={1}".format(url,name), headers=headers)
++        if r.status_code < 300:
++            ret_json = r.json()
++            if not ret_json["servers"]:
++                return 0
++            r = requests.get("http://{0}/compute/v2.1/servers/{1}".format(url,ret_json["servers"][0]["id"]), headers=headers)
++            if r.status_code < 300:
++                ret_json = r.json()
++                return int(ret_json["server"]["metadata"]["vm_count_no"])
++            else:
++                return 0
++        else:
++            return 0
+ 
+     def _create_tag_list_obj(self, context, tags):
+         """Create TagList objects from simple string tags.
+diff --git a/nova/conf/compute.py b/nova/conf/compute.py
+index 2518cd6..2e49b6e 100644
+--- a/nova/conf/compute.py
++++ b/nova/conf/compute.py
+@@ -75,8 +75,9 @@ Possible values:
+                 img_signature_certificate_uuid
+ 
+ """),
++    cfg.BoolOpt('force_multi_instance_display_name', default=True, help=""),
+     cfg.StrOpt('multi_instance_display_name_template',
+-        default='%(name)s-%(count)d',
++        default='%(name)s-%(count)d-%(project-name)s',
+         deprecated_for_removal=True,
+         deprecated_since='15.0.0',
+         deprecated_reason="""
